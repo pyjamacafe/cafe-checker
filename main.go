@@ -198,6 +198,38 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(SubmitResponse{})
 }
 
+type ExecRequest struct {
+	Command string `json:"command"`
+}
+
+func execHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Command == "" {
+		json.NewEncoder(w).Encode(SubmitResponse{
+			Stderr:   "Invalid or empty command",
+			ExitCode: 1,
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res := runCmd(ctx, "sh", []string{"-c", req.Command}, tmpDir)
+	json.NewEncoder(w).Encode(res)
+}
+
 func main() {
 	os.MkdirAll(tmpDir, 0777)
 
@@ -212,6 +244,7 @@ func main() {
 		w.Write([]byte("Hey there :)"))
 	})
 	mux.HandleFunc("/api/submit", submitHandler)
+	mux.HandleFunc("/api/exec", execHandler)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("Hey there :)"))
