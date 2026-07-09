@@ -119,30 +119,44 @@ func runCmd(ctx context.Context, name string, args []string, dir string) SubmitR
 	}
 }
 
+func logRequest(r *http.Request, status string, dur time.Duration, extra ...string) {
+	fields := fmt.Sprintf("method=%s path=%s status=%s duration=%s", r.Method, r.URL.Path, status, dur)
+	for _, e := range extra {
+		fields += " " + e
+	}
+	log.Println(fields)
+}
+
 func submitHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
+		logRequest(r, "204", time.Since(start))
 		return
 	}
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		logRequest(r, "405", time.Since(start))
 		return
 	}
 
 	var req SubmitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		logRequest(r, "400", time.Since(start))
 		return
 	}
+	log.Printf("submit language=%s files=%d", req.Language, len(req.Files))
 
 	if len(req.Files) == 0 {
 		json.NewEncoder(w).Encode(SubmitResponse{
 			Stderr:   "No files provided",
 			ExitCode: 1,
 		})
+		logRequest(r, "200", time.Since(start), "phase=reject reason=no_files")
 		return
 	}
 
@@ -152,6 +166,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 			Stderr:   fmt.Sprintf("Unsupported language: %s", req.Language),
 			ExitCode: 1,
 		})
+		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=reject reason=unsupported_lang lang=%s", req.Language))
 		return
 	}
 
@@ -161,6 +176,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 			Stderr:   err.Error(),
 			ExitCode: 1,
 		})
+		logRequest(r, "200", time.Since(start), "phase=reject reason=write_error")
 		return
 	}
 	defer os.RemoveAll(dir)
@@ -172,6 +188,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		if res.ExitCode != 0 {
 			res.Phase = "compile"
 			json.NewEncoder(w).Encode(res)
+			logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=compile exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
 			return
 		}
 	}
@@ -183,6 +200,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		if res.ExitCode != 0 {
 			res.Phase = "link"
 			json.NewEncoder(w).Encode(res)
+			logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=link exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
 			return
 		}
 	}
@@ -192,10 +210,12 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		res := runCmd(ctx, cfg.Runner[0], cfg.Runner[1:], dir)
 		cancel()
 		json.NewEncoder(w).Encode(res)
+		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=run exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
 		return
 	}
 
 	json.NewEncoder(w).Encode(SubmitResponse{})
+	logRequest(r, "200", time.Since(start), "phase=noop")
 }
 
 type ExecRequest struct {
@@ -203,15 +223,18 @@ type ExecRequest struct {
 }
 
 func execHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
+		logRequest(r, "204", time.Since(start))
 		return
 	}
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		logRequest(r, "405", time.Since(start))
 		return
 	}
 
@@ -221,13 +244,16 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 			Stderr:   "Invalid or empty command",
 			ExitCode: 1,
 		})
+		logRequest(r, "200", time.Since(start), "phase=reject reason=invalid_command")
 		return
 	}
+	log.Printf("exec command=%q", req.Command)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	res := runCmd(ctx, "sh", []string{"-c", req.Command}, tmpDir)
 	json.NewEncoder(w).Encode(res)
+	logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=exec exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
 }
 
 func main() {
@@ -235,19 +261,24 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
+			logRequest(r, "404", time.Since(start))
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Hey there :)"))
+		logRequest(r, "200", time.Since(start))
 	})
 	mux.HandleFunc("/api/submit", submitHandler)
 	mux.HandleFunc("/api/exec", execHandler)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("Hey there :)"))
+		logRequest(r, "200", time.Since(start))
 	})
 
 	log.Printf("Judge server listening on port %s", port)
