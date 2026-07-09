@@ -1,0 +1,14 @@
+services:
+  cafe-checker:
+    build: .
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+    mem_limit: 256m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp/judge:size=32m,exec
