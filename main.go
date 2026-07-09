@@ -202,9 +202,19 @@ func main() {
 	os.MkdirAll(tmpDir, 0777)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Hey there :)"))
+	})
 	mux.HandleFunc("/api/submit", submitHandler)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("Hey there :)"))
 	})
 
 	log.Printf("Judge server listening on port %s", port)
