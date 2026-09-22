@@ -29,6 +29,7 @@ type File struct {
 type SubmitRequest struct {
 	Files    []File `json:"files"`
 	Language string `json:"language"`
+	Command  string `json:"command"`
 }
 
 type SubmitResponse struct {
@@ -161,7 +162,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg, ok := languages[req.Language]
-	if !ok {
+	if !ok && req.Command == "" {
 		json.NewEncoder(w).Encode(SubmitResponse{
 			Stderr:   fmt.Sprintf("Unsupported language: %s", req.Language),
 			ExitCode: 1,
@@ -180,6 +181,19 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(dir)
+
+	// Author-defined check command ({{< run_check >}}): run it with the
+	// student's files in the working directory and use its exit code.
+	if req.Command != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		res := runCmd(ctx, "sh", []string{"-c", req.Command}, dir)
+		cancel()
+		res.Phase = "check"
+		log.Printf("check command=%q exit=%d timedOut=%v", req.Command, res.ExitCode, res.TimedOut)
+		json.NewEncoder(w).Encode(res)
+		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=check exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
+		return
+	}
 
 	if len(cfg.Compile) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
