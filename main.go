@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -27,9 +29,8 @@ type File struct {
 }
 
 type SubmitRequest struct {
-	Files    []File `json:"files"`
-	Language string `json:"language"`
-	Command  string `json:"command"`
+	Files   []File `json:"files"`
+	Command string `json:"command"`
 }
 
 type SubmitResponse struct {
@@ -39,31 +40,6 @@ type SubmitResponse struct {
 	TimedOut bool   `json:"timedOut"`
 	Error    string `json:"error,omitempty"`
 	Phase    string `json:"phase,omitempty"`
-}
-
-type LangConfig struct {
-	Compile []string
-	Link    []string
-	Runner  []string
-}
-
-var languages = map[string]LangConfig{
-	"c": {
-		Compile: []string{"gcc", "-x", "c", "-std=c11", "-Wall", "-O0", "-o", "program", "main.c"},
-		Runner:  []string{"./program"},
-	},
-	"cpp": {
-		Compile: []string{"g++", "-x", "c++", "-std=c++17", "-Wall", "-O0", "-o", "program", "main.cpp"},
-		Runner:  []string{"./program"},
-	},
-	"python": {
-		Runner: []string{"python3", "main.py"},
-	},
-	"assembly": {
-		Compile: []string{"as", "-o", "program.o", "main.s"},
-		Link:    []string{"gcc", "-o", "program", "program.o"},
-		Runner:  []string{"./program"},
-	},
 }
 
 func randomDir() string {
@@ -88,12 +64,31 @@ func writeFiles(dir string, files []File) error {
 func runCmd(ctx context.Context, name string, args []string, dir string) SubmitResponse {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	// Run in a dedicated process group so we can kill the whole tree (the shell
+	// and anything it spawns), not just the direct child. Otherwise a command
+	// that backgrounds a process would leave it orphaned and outlive the request.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// If a grandchild keeps stdout/stderr open after the main process exits,
+	// don't block forever waiting for the pipes to close.
+	cmd.WaitDelay = 2 * time.Second
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+
+	// Reap anything still left in the group (e.g. backgrounded children). This is
+	// a no-op when the group is already empty (ESRCH).
+	if cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	var exitCode int
 	timedOut := false
@@ -150,7 +145,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		logRequest(r, "400", time.Since(start))
 		return
 	}
-	log.Printf("submit language=%s files=%d", req.Language, len(req.Files))
+	log.Printf("submit command=%q files=%d", req.Command, len(req.Files))
 
 	if len(req.Files) == 0 {
 		json.NewEncoder(w).Encode(SubmitResponse{
@@ -161,17 +156,25 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, ok := languages[req.Language]
-	if !ok && req.Command == "" {
+	// The judge runs only the command a lesson defines via {{< run_check >}}.
+	// There is no built-in per-language compile/run.
+	if strings.TrimSpace(req.Command) == "" {
 		json.NewEncoder(w).Encode(SubmitResponse{
-			Stderr:   fmt.Sprintf("Unsupported language: %s", req.Language),
+			Stderr:   "No check command provided",
 			ExitCode: 1,
 		})
-		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=reject reason=unsupported_lang lang=%s", req.Language))
+		logRequest(r, "200", time.Since(start), "phase=reject reason=no_command")
 		return
 	}
 
 	dir := randomDir()
+	// Always clean up the submitted files once the command has finished — even if
+	// writing them failed partway or the command errored/timed out.
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("cleanup failed dir=%s err=%v", dir, err)
+		}
+	}()
 	if err := writeFiles(dir, req.Files); err != nil {
 		json.NewEncoder(w).Encode(SubmitResponse{
 			Stderr:   err.Error(),
@@ -180,94 +183,14 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		logRequest(r, "200", time.Since(start), "phase=reject reason=write_error")
 		return
 	}
-	defer os.RemoveAll(dir)
 
-	// Author-defined check command ({{< run_check >}}): run it with the
-	// student's files in the working directory and use its exit code.
-	if req.Command != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		res := runCmd(ctx, "sh", []string{"-c", req.Command}, dir)
-		cancel()
-		res.Phase = "check"
-		log.Printf("check command=%q exit=%d timedOut=%v", req.Command, res.ExitCode, res.TimedOut)
-		json.NewEncoder(w).Encode(res)
-		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=check exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
-		return
-	}
-
-	if len(cfg.Compile) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		res := runCmd(ctx, cfg.Compile[0], cfg.Compile[1:], dir)
-		cancel()
-		if res.ExitCode != 0 {
-			res.Phase = "compile"
-			json.NewEncoder(w).Encode(res)
-			logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=compile exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
-			return
-		}
-	}
-
-	if len(cfg.Link) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		res := runCmd(ctx, cfg.Link[0], cfg.Link[1:], dir)
-		cancel()
-		if res.ExitCode != 0 {
-			res.Phase = "link"
-			json.NewEncoder(w).Encode(res)
-			logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=link exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
-			return
-		}
-	}
-
-	if len(cfg.Runner) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		res := runCmd(ctx, cfg.Runner[0], cfg.Runner[1:], dir)
-		cancel()
-		json.NewEncoder(w).Encode(res)
-		logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=run exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
-		return
-	}
-
-	json.NewEncoder(w).Encode(SubmitResponse{})
-	logRequest(r, "200", time.Since(start), "phase=noop")
-}
-
-type ExecRequest struct {
-	Command string `json:"command"`
-}
-
-func execHandler(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		logRequest(r, "204", time.Since(start))
-		return
-	}
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		logRequest(r, "405", time.Since(start))
-		return
-	}
-
-	var req ExecRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Command == "" {
-		json.NewEncoder(w).Encode(SubmitResponse{
-			Stderr:   "Invalid or empty command",
-			ExitCode: 1,
-		})
-		logRequest(r, "200", time.Since(start), "phase=reject reason=invalid_command")
-		return
-	}
-	log.Printf("exec command=%q", req.Command)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	res := runCmd(ctx, "sh", []string{"-c", req.Command}, tmpDir)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	res := runCmd(ctx, "sh", []string{"-c", req.Command}, dir)
+	cancel()
+	res.Phase = "check"
+	log.Printf("check command=%q exit=%d timedOut=%v", req.Command, res.ExitCode, res.TimedOut)
 	json.NewEncoder(w).Encode(res)
-	logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=exec exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
+	logRequest(r, "200", time.Since(start), fmt.Sprintf("phase=check exit=%d timedOut=%v", res.ExitCode, res.TimedOut))
 }
 
 func main() {
@@ -287,7 +210,6 @@ func main() {
 		logRequest(r, "200", time.Since(start))
 	})
 	mux.HandleFunc("/api/submit", submitHandler)
-	mux.HandleFunc("/api/exec", execHandler)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
